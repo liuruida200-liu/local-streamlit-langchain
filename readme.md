@@ -1,51 +1,64 @@
-# PDFs Chatbot using Langchain, GPT 3.5 and Llama 2
-This is a Python gui application that demonstrates how to build a custom PDF chatbot using LangChain and GPT 3.5 / Llama 2. 
+# PDF Q&A Chatbot using LangChain and Open-Source Models
 
+A Python application that builds a custom PDF Q&A chatbot using LangChain, HuggingFace embeddings, and the Qwen2.5-1.5B-Instruct LLM. All components run locally with no API keys required.
 
-## How it works (GPT 3.5)
-1. The application gui is built using streamlit
-2. The application reads text from PDF files, splits it into chunks
-3. Uses OpenAI Embedding API to generate embedding vectors used to find the most relevant content to a user's question 
-4. Build a conversational retrieval chain using Langchain
-5. Use OpenAI GPT API to generate respond based on content in PDF
+## How it works
 
+1. PDF documents are uploaded (via web UI or CLI) and text is extracted using PyPDF2
+2. Extracted text is split into 500-character chunks using `RecursiveCharacterTextSplitter`
+3. Chunks are embedded using `sentence-transformers/all-MiniLM-L6-v2` and stored in a FAISS vector store
+4. A conversational retrieval chain is built using LangChain with `ConversationBufferMemory`
+5. User questions are answered by `Qwen/Qwen2.5-1.5B-Instruct` using relevant chunks retrieved via similarity search
+6. All documents, chunks, and chat history are persisted in a SQLite database (`chatbot.db`)
 
 ## Requirements
-1. Install the following Python packages:
-```
-pip install streamlit pypdf2 langchain python-dotenv faiss-cpu openai sentence_transformers
-```
 
-2. Create a `.env` file in the root directory of the project and add the following environment variables:
-```
-OPENAI_API_KEY= # Your OpenAI API key
-```
+### Prerequisites
+- Python 3.10+
+- NVIDIA GPU with CUDA support (recommended)
 
+### Installation
+```bash
+pip install streamlit pypdf2 langchain langchain-community langchain-classic langchain-core langchain-huggingface langchain-text-splitters faiss-cpu python-dotenv sentence-transformers accelerate
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
 
 ## Code Structure
 
-The code is structured as follows:
-
-- `app.py`: The main application file that defines the Streamlit gui app and the user interface.
-    * get_pdf_text function: reads text from PDF files
-    * get_text_chunks function: splits text into chunks
-    * get_vectorstore function: creates a FAISS vectorstore from text chunks and their embeddings
-    * get_conversation_chain function: creates a retrieval chain from vectorstore
-    * handle_userinput function: generates response from OpenAI GPT API
-- `htmlTemplates.py`: A module that defines HTML templates for the user interface.
-
+- `app.py`: Streamlit web interface with Claude-style chat UI
+    * `get_pdf_text`: extracts text from uploaded PDFs and stores pages in SQLite
+    * `get_text_chunks`: splits text into 500-char chunks and stores in SQLite
+    * `get_vectorstore`: creates a FAISS vector store using HuggingFace embeddings
+    * `get_conversation_chain`: loads Qwen2.5-1.5B-Instruct and creates a retrieval chain
+- `cli.py`: Command-line driver for terminal-based Q&A (type `exit` to quit)
+- `db.py`: SQLite database module with three tables: `documents`, `chunks`, `chat_history`
+- `htmlTemplates.py`: HTML/CSS templates for chat message styling (legacy)
 
 ## How to run
-```
+
+### Web Interface (Streamlit)
+```bash
 streamlit run app.py
 ```
+1. Upload PDFs in the sidebar
+2. Click "Process"
+3. Ask questions in the chat input at the bottom
 
+### CLI Driver
+```bash
+# Process PDFs and start Q&A
+python cli.py "Ads cookbook .pdf" ads_data_html/licensing.pdf
 
-## Update to use Llama 2 running locally
-1. Install Python bindings for llama.cpp library
+# Use documents already stored in the database
+python cli.py
 ```
-pip install llama-cpp-python
-```
-2. Download the llama 2 7B GGML model from https://huggingface.co/TheBloke/LLaMa-7B-GGML/blob/main/llama-7b.ggmlv3.q4_1.bin and place it in the models folder
-3. Switch language model to use Llama 2 loaded by LlamaCpp
-4. Switch embedding model to MiniLM-L6-v2 using HuggingFaceEmbeddings
+Type your questions at the `You:` prompt. Type `exit` to quit.
+
+## Models Used
+
+| Component | Model | Size |
+|-----------|-------|------|
+| Embedding | `sentence-transformers/all-MiniLM-L6-v2` | ~80MB |
+| LLM | `Qwen/Qwen2.5-1.5B-Instruct` | ~3GB |
+
+Both models are downloaded automatically on first run from HuggingFace Hub.
