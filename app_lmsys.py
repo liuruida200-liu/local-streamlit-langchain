@@ -1,7 +1,6 @@
 import os
 import shutil
 import sqlite3
-
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
@@ -68,12 +67,10 @@ def reset_database():
 def insert_document(file_name, full_text):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute(
         "INSERT INTO pdf_documents (file_name, full_text) VALUES (?, ?)",
         (file_name, full_text)
     )
-
     document_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -128,8 +125,7 @@ def get_text_chunks(text):
         chunk_overlap=120,
         length_function=len
     )
-    chunks = text_splitter.split_text(text)
-    return chunks
+    return text_splitter.split_text(text)
 
 
 def process_pdfs_and_store(pdf_docs):
@@ -193,13 +189,11 @@ def load_vectorstore():
         encode_kwargs={"normalize_embeddings": False}
     )
 
-    vectorstore = FAISS.load_local(
+    return FAISS.load_local(
         VECTORSTORE_DIR,
         embeddings,
         allow_dangerous_deserialization=True
     )
-
-    return vectorstore
 
 
 @st.cache_resource
@@ -252,8 +246,7 @@ def load_local_llm():
         pad_token_id=tokenizer.eos_token_id
     )
 
-    llm = HuggingFacePipeline(pipeline=pipe)
-    return llm
+    return HuggingFacePipeline(pipeline=pipe)
 
 
 def build_prompt():
@@ -296,21 +289,17 @@ def get_conversation_chain(vectorstore):
         output_key="answer"
     )
 
-    custom_prompt = build_prompt()
-
-    conversation_chain = ConversationalRetrievalChain.from_llm(
+    return ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=vectorstore.as_retriever(
             search_type="similarity",
             search_kwargs={"k": 3}
         ),
         memory=memory,
-        combine_docs_chain_kwargs={"prompt": custom_prompt},
+        combine_docs_chain_kwargs={"prompt": build_prompt()},
         return_source_documents=True,
         output_key="answer"
     )
-
-    return conversation_chain
 
 
 def clean_response(answer):
@@ -353,9 +342,7 @@ def handle_userinput(user_question):
 
     response = st.session_state.conversation({"question": user_question})
 
-    answer = response.get("answer", "")
-    answer = clean_response(answer)
-
+    answer = clean_response(response.get("answer", ""))
     chat_history = response.get("chat_history", [])
     source_docs = response.get("source_documents", [])
 
@@ -379,17 +366,7 @@ def handle_userinput(user_question):
     with st.expander("Retrieved Chunks"):
         for i, doc in enumerate(source_docs):
             st.write(f"Chunk {i + 1}:")
-
-            metadata = doc.metadata if hasattr(doc, "metadata") else {}
-            file_name = metadata.get("file_name", "Unknown")
-            chunk_index = metadata.get("chunk_index", "Unknown")
-            document_id = metadata.get("document_id", "Unknown")
-
-            st.write(f"File: {file_name}")
-            st.write(f"Document ID: {document_id}")
-            st.write(f"Chunk Index: {chunk_index}")
             st.write(doc.page_content)
-            st.write("---")
 
 
 def main():
@@ -400,14 +377,7 @@ def main():
     st.write(css, unsafe_allow_html=True)
 
     if "conversation" not in st.session_state:
-        try:
-            vectorstore = load_vectorstore()
-            if vectorstore is not None:
-                st.session_state.conversation = get_conversation_chain(vectorstore)
-            else:
-                st.session_state.conversation = None
-        except Exception:
-            st.session_state.conversation = None
+        st.session_state.conversation = None
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = None
@@ -422,16 +392,9 @@ def main():
     with col2:
         if st.button("Clear Chat"):
             st.session_state.chat_history = None
-
-            if os.path.exists(VECTORSTORE_DIR):
-                try:
-                    vectorstore = load_vectorstore()
-                    if vectorstore is not None:
-                        st.session_state.conversation = get_conversation_chain(vectorstore)
-                    else:
-                        st.session_state.conversation = None
-                except Exception:
-                    st.session_state.conversation = None
+            vectorstore = load_vectorstore()
+            if vectorstore is not None:
+                st.session_state.conversation = get_conversation_chain(vectorstore)
             else:
                 st.session_state.conversation = None
 
