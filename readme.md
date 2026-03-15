@@ -60,5 +60,6 @@ Type your questions at the `You:` prompt. Type `exit` to quit.
 |-----------|-------|------|
 | Embedding | `sentence-transformers/all-MiniLM-L6-v2` | ~80MB |
 | LLM | `Qwen/Qwen2.5-1.5B-Instruct` | ~3GB |
+| LLM | `Qwen/Qwen2.5-7B-Instruct` | ~14~16GB |
 
 Both models are downloaded automatically on first run from HuggingFace Hub.
