@@ -1,3 +1,7 @@
+import os
+import shutil
+import sqlite3
+
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
@@ -5,11 +9,18 @@ from PyPDF2 import PdfReader
 from langchain_text_splitters import CharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
 from langchain_community.vectorstores import FAISS
+from langchain_classic.memory import ConversationBufferMemory
+from langchain_classic.chains import ConversationalRetrievalChain
+from langchain_core.prompts import PromptTemplate
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import torch
 
 from htmlTemplates import css, bot_template, user_template
+
+
+DB_PATH = "chatbot_lab9.db"
+VECTORSTORE_DIR = "faiss_index"
 
 
 def require_cuda():
@@ -19,6 +30,83 @@ def require_cuda():
         )
 
 
+def init_database():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pdf_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT NOT NULL,
+            full_text TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS text_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_text TEXT NOT NULL,
+            FOREIGN KEY (document_id) REFERENCES pdf_documents(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def reset_database():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM text_chunks")
+    cursor.execute("DELETE FROM pdf_documents")
+    conn.commit()
+    conn.close()
+
+
+def insert_document(file_name, full_text):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "INSERT INTO pdf_documents (file_name, full_text) VALUES (?, ?)",
+        (file_name, full_text)
+    )
+
+    document_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return document_id
+
+
+def insert_chunks(document_id, chunks):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    for idx, chunk in enumerate(chunks):
+        cursor.execute(
+            "INSERT INTO text_chunks (document_id, chunk_index, chunk_text) VALUES (?, ?, ?)",
+            (document_id, idx, chunk)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def extract_text_from_pdf(pdf_file):
+    text = ""
+    pdf_file.seek(0)
+    pdf_reader = PdfReader(pdf_file)
+
+    for page in pdf_reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
+
+    return text
+
+
 def get_pdf_text(pdf_docs):
     text = ""
 
@@ -26,11 +114,9 @@ def get_pdf_text(pdf_docs):
         return text
 
     for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+        pdf_text = extract_text_from_pdf(pdf)
+        if pdf_text:
+            text += pdf_text + "\n"
 
     return text
 
@@ -46,7 +132,32 @@ def get_text_chunks(text):
     return chunks
 
 
-def get_vectorstore(text_chunks):
+def process_pdfs_and_store(pdf_docs):
+    all_chunks = []
+    all_metadatas = []
+
+    reset_database()
+
+    for pdf in pdf_docs:
+        full_text = extract_text_from_pdf(pdf)
+
+        if full_text.strip():
+            document_id = insert_document(pdf.name, full_text)
+            chunks = get_text_chunks(full_text)
+            insert_chunks(document_id, chunks)
+
+            for idx, chunk in enumerate(chunks):
+                all_chunks.append(chunk)
+                all_metadatas.append({
+                    "document_id": document_id,
+                    "file_name": pdf.name,
+                    "chunk_index": idx
+                })
+
+    return all_chunks, all_metadatas
+
+
+def get_vectorstore(text_chunks, metadatas):
     require_cuda()
 
     st.write("Embedding device: cuda")
@@ -57,9 +168,35 @@ def get_vectorstore(text_chunks):
         encode_kwargs={"normalize_embeddings": False}
     )
 
+    if os.path.exists(VECTORSTORE_DIR):
+        shutil.rmtree(VECTORSTORE_DIR)
+
     vectorstore = FAISS.from_texts(
         texts=text_chunks,
-        embedding=embeddings
+        embedding=embeddings,
+        metadatas=metadatas
+    )
+
+    vectorstore.save_local(VECTORSTORE_DIR)
+    return vectorstore
+
+
+def load_vectorstore():
+    require_cuda()
+
+    if not os.path.exists(VECTORSTORE_DIR):
+        return None
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cuda"},
+        encode_kwargs={"normalize_embeddings": False}
+    )
+
+    vectorstore = FAISS.load_local(
+        VECTORSTORE_DIR,
+        embeddings,
+        allow_dangerous_deserialization=True
     )
 
     return vectorstore
@@ -119,8 +256,8 @@ def load_local_llm():
     return llm
 
 
-def build_prompt(context, question):
-    prompt = f"""
+def build_prompt():
+    template = """
 USER: You are a document question answering assistant.
 
 Use ONLY the provided context to answer the question.
@@ -144,7 +281,36 @@ Question:
 
 ASSISTANT:
 """
-    return prompt
+    return PromptTemplate(
+        input_variables=["context", "question"],
+        template=template
+    )
+
+
+def get_conversation_chain(vectorstore):
+    llm = load_local_llm()
+
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer"
+    )
+
+    custom_prompt = build_prompt()
+
+    conversation_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 3}
+        ),
+        memory=memory,
+        combine_docs_chain_kwargs={"prompt": custom_prompt},
+        return_source_documents=True,
+        output_key="answer"
+    )
+
+    return conversation_chain
 
 
 def clean_response(answer):
@@ -160,7 +326,11 @@ def clean_response(answer):
         "Restarting computer",
         "part-of-speonia",
         "Define the year of the year",
-        "licpart"
+        "licpart",
+        "part 1:",
+        "part 2:",
+        "part 3:",
+        "port 2:"
     ]
 
     for pattern in weird_patterns:
@@ -170,62 +340,77 @@ def clean_response(answer):
     if len(answer) > 300:
         answer = answer[:300].strip()
 
+    if not answer:
+        return "Answer not found in uploaded document."
+
     return answer
 
 
 def handle_userinput(user_question):
-    if st.session_state.vectorstore is None:
+    if st.session_state.conversation is None:
         st.warning("Please upload and process your PDF first!")
         return
 
-    docs = st.session_state.vectorstore.similarity_search(user_question, k=3)
+    response = st.session_state.conversation({"question": user_question})
 
-    context_parts = []
-    for doc in docs:
-        if doc.page_content:
-            context_parts.append(doc.page_content)
+    answer = response.get("answer", "")
+    answer = clean_response(answer)
 
-    context = "\n\n".join(context_parts).strip()
+    chat_history = response.get("chat_history", [])
+    source_docs = response.get("source_documents", [])
 
-    if not context:
-        answer = "Answer not found in uploaded document."
-    else:
-        llm = load_local_llm()
-        prompt = build_prompt(context, user_question)
-        raw_answer = llm.invoke(prompt)
-        answer = clean_response(raw_answer)
+    st.session_state.chat_history = chat_history
 
-    st.session_state.chat_history.append(("user", user_question))
-    st.session_state.chat_history.append(("bot", answer))
+    if st.session_state.chat_history:
+        st.session_state.chat_history[-1].content = answer
 
-    for role, message in st.session_state.chat_history:
-        if role == "user":
+    for i, message in enumerate(st.session_state.chat_history):
+        if i % 2 == 0:
             st.write(
-                user_template.replace("{{MSG}}", message),
+                user_template.replace("{{MSG}}", message.content),
                 unsafe_allow_html=True
             )
         else:
             st.write(
-                bot_template.replace("{{MSG}}", message),
+                bot_template.replace("{{MSG}}", message.content),
                 unsafe_allow_html=True
             )
 
     with st.expander("Retrieved Chunks"):
-        for i, doc in enumerate(docs):
+        for i, doc in enumerate(source_docs):
             st.write(f"Chunk {i + 1}:")
+
+            metadata = doc.metadata if hasattr(doc, "metadata") else {}
+            file_name = metadata.get("file_name", "Unknown")
+            chunk_index = metadata.get("chunk_index", "Unknown")
+            document_id = metadata.get("document_id", "Unknown")
+
+            st.write(f"File: {file_name}")
+            st.write(f"Document ID: {document_id}")
+            st.write(f"Chunk Index: {chunk_index}")
             st.write(doc.page_content)
+            st.write("---")
 
 
 def main():
     load_dotenv()
+    init_database()
+
     st.set_page_config(page_title="Chat with PDFs", page_icon="🤖")
     st.write(css, unsafe_allow_html=True)
 
-    if "vectorstore" not in st.session_state:
-        st.session_state.vectorstore = None
+    if "conversation" not in st.session_state:
+        try:
+            vectorstore = load_vectorstore()
+            if vectorstore is not None:
+                st.session_state.conversation = get_conversation_chain(vectorstore)
+            else:
+                st.session_state.conversation = None
+        except Exception:
+            st.session_state.conversation = None
 
     if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+        st.session_state.chat_history = None
 
     st.header("Chat with PDFs 🤖")
 
@@ -236,7 +421,19 @@ def main():
 
     with col2:
         if st.button("Clear Chat"):
-            st.session_state.chat_history = []
+            st.session_state.chat_history = None
+
+            if os.path.exists(VECTORSTORE_DIR):
+                try:
+                    vectorstore = load_vectorstore()
+                    if vectorstore is not None:
+                        st.session_state.conversation = get_conversation_chain(vectorstore)
+                    else:
+                        st.session_state.conversation = None
+                except Exception:
+                    st.session_state.conversation = None
+            else:
+                st.session_state.conversation = None
 
     if user_question:
         handle_userinput(user_question)
@@ -255,19 +452,18 @@ def main():
                 st.warning("Please upload at least one PDF file.")
             else:
                 with st.spinner("Processing"):
-                    raw_text = get_pdf_text(pdf_docs)
+                    try:
+                        text_chunks, metadatas = process_pdfs_and_store(pdf_docs)
 
-                    if not raw_text.strip():
-                        st.warning("No readable text was found in the uploaded PDFs.")
-                    else:
-                        try:
-                            text_chunks = get_text_chunks(raw_text)
-                            vectorstore = get_vectorstore(text_chunks)
-                            st.session_state.vectorstore = vectorstore
-                            st.session_state.chat_history = []
+                        if not text_chunks:
+                            st.warning("No readable text was found in the uploaded PDFs.")
+                        else:
+                            vectorstore = get_vectorstore(text_chunks, metadatas)
+                            st.session_state.conversation = get_conversation_chain(vectorstore)
+                            st.session_state.chat_history = None
                             st.success("Processing complete.")
-                        except Exception as e:
-                            st.error(f"Error while processing documents: {e}")
+                    except Exception as e:
+                        st.error(f"Error while processing documents: {e}")
 
 
 if __name__ == "__main__":
